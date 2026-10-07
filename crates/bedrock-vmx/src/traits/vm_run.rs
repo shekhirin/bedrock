@@ -274,6 +274,13 @@ where
 
         inject_pending_interrupt(ctx).map_err(VmRunError::ExitHandler)?;
 
+        // Interrupt preparation may stage an event in the full trace buffer.
+        // Drain before entering the guest, or its next exit record is dropped.
+        if ctx.state().event_buffer_full() {
+            ctx.state_mut().exit_stats.total_run_cycles += rdtsc().saturating_sub(loop_start_tsc);
+            break Ok(ExitReason::EventBufferFull);
+        }
+
         let pre_entry_tsc = rdtsc();
         ctx.state_mut().exit_stats.vmentry_overhead_cycles +=
             pre_entry_tsc.saturating_sub(loop_start_tsc);
@@ -402,4 +409,122 @@ where
 
     finish_result?;
     loop_result
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::*;
+    use crate::events::{
+        EventCategories, EventKind, InjectSource, EVENT_BUFFER_SIZE, EVENT_HEADER_SIZE,
+    };
+    use crate::test_mocks::{MockFrameAllocator, MockMachine, MockVmcs};
+    use crate::tests::MockVmContext;
+    use crate::traits::{VmEntryError, VmxContext};
+
+    #[derive(Default)]
+    struct CountingRunner {
+        entries: usize,
+    }
+
+    impl VmRunner for CountingRunner {
+        type Vmcs = MockVmcs;
+
+        unsafe fn run(
+            &mut self,
+            _ctx: &mut VmxContext,
+            _vmcs: &Self::Vmcs,
+        ) -> Result<(), VmEntryError> {
+            self.entries += 1;
+            Err(VmEntryError::VmEntryFailed)
+        }
+    }
+
+    #[test]
+    fn timer_event_overflow_returns_before_guest_entry() {
+        let mut ctx = MockVmContext::new();
+        let mut buffer = std::vec![0u8; EVENT_BUFFER_SIZE];
+        ctx.state_mut().set_event_buffer(buffer.as_mut_ptr());
+        ctx.state_mut()
+            .set_event_categories(EventCategories::SERIAL.union(EventCategories::INJECT));
+
+        // Fill with valid records, leaving only a header's worth of room:
+        // the timer's header + 16-byte payload will have to be staged.
+        let payload = [0u8; 4096];
+        while EVENT_BUFFER_SIZE - ctx.state().event_buffer_len()
+            >= 2 * EVENT_HEADER_SIZE + payload.len()
+        {
+            assert!(ctx.state_mut().event_append(EventKind::Serial, &payload));
+        }
+        let remaining_payload =
+            EVENT_BUFFER_SIZE - ctx.state().event_buffer_len() - 2 * EVENT_HEADER_SIZE;
+        assert!(ctx
+            .state_mut()
+            .event_append(EventKind::Serial, &payload[..remaining_payload]));
+        let len_before = ctx.state().event_buffer_len();
+        let seq_before = ctx.state().event_seq;
+        assert!(!ctx.state().event_buffer_full());
+
+        ctx.set_emulated_tsc(100);
+        ctx.state_mut().devices.apic.svr = 1 << 8;
+        ctx.state_mut().devices.apic.lvt_timer = 0xEC;
+        ctx.state_mut().devices.apic.timer_deadline = 100;
+        ctx.set_guest_rflags(1 << 9);
+        ctx.vmcs_setup()
+            .set_field32(VmcsField32::IdtVectoringInfo, 0);
+        ctx.vmcs_setup()
+            .set_field32(VmcsField32::GuestInterruptibilityState, 0);
+        ctx.vmcs_setup()
+            .set_field32(VmcsField32::PrimaryProcBasedVmExecControls, 0);
+
+        let mut runner = CountingRunner::default();
+        let mut allocator = MockFrameAllocator::new();
+        // SAFETY: All hardware access, IRQ control and guest entry are mocked.
+        let result = unsafe { run(&mut ctx, &mut runner, &MockMachine, &mut allocator) };
+        assert!(matches!(result, Ok(ExitReason::EventBufferFull)));
+        assert_eq!(runner.entries, 0);
+        assert!(ctx.state().event_buffer_full());
+        assert_eq!(ctx.state().event_buffer_len(), len_before);
+        assert_eq!(ctx.state().event_seq, seq_before);
+        assert_eq!(ctx.state().devices.apic.timer_deadline, 0);
+        assert_eq!(
+            ctx.vmcs_setup()
+                .get_field32(VmcsField32::VmEntryInterruptionInfo),
+            Some((1 << 31) | 0xEC)
+        );
+
+        ctx.state_mut().event_clear();
+        assert!(!ctx.state().event_buffer_full());
+        assert_eq!(ctx.state().event_buffer_len(), EVENT_HEADER_SIZE + 16);
+        assert_eq!(ctx.state().event_seq, seq_before + 1);
+        assert_eq!(
+            u64::from_le_bytes(buffer[..8].try_into().unwrap()),
+            seq_before
+        );
+        assert_eq!(
+            u16::from_le_bytes(buffer[24..26].try_into().unwrap()),
+            EventKind::Inject.as_u16()
+        );
+        assert_eq!(buffer[EVENT_HEADER_SIZE], 0xEC);
+        assert_eq!(buffer[EVENT_HEADER_SIZE + 1], InjectSource::Timer as u8);
+        assert_eq!(
+            u64::from_le_bytes(
+                buffer[EVENT_HEADER_SIZE + 8..EVENT_HEADER_SIZE + 16]
+                    .try_into()
+                    .unwrap()
+            ),
+            100
+        );
+
+        // After the drain, entry is allowed and the timer event isn't duplicated.
+        // SAFETY: All hardware access, IRQ control and guest entry are mocked.
+        let result = unsafe { run(&mut ctx, &mut runner, &MockMachine, &mut allocator) };
+        assert!(matches!(
+            result,
+            Err(VmRunError::VmEntry(VmEntryError::VmEntryFailed))
+        ));
+        assert_eq!(runner.entries, 1);
+        assert_eq!(ctx.state().event_seq, seq_before + 1);
+    }
 }
